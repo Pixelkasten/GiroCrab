@@ -814,32 +814,77 @@ pub(crate) fn match_existing(rows: &[MmRow], existing: &[Existing]) -> Vec<Optio
 /// "Muller" from MoneyMoney), the IBANs not contradicting each other (one side
 /// without, or both the same). Pass 3 compares names exactly and only for
 /// rows without IBAN, so an accent or an IBAN on one side only kept them
-/// apart. In order, like the other passes.
+/// apart.
+///
+/// A row without IBAN fits every candidate, so taking the first fit could
+/// leave a row with IBAN without its only partner. The pass therefore finds a
+/// maximum assignment (augmenting paths – the groups of same date, amount
+/// and name are tiny), trying candidates with the same IBAN first, so the
+/// category goes to the booking that matches best. Independent of row order
+/// as far as the result's size goes.
 pub(crate) fn match_folded_name(
     rows: &[MmRow],
     existing: &[Existing],
     out: &mut [Option<usize>],
     used: &mut [bool],
 ) {
-    for (r, m) in rows.iter().zip(out.iter_mut()) {
-        if m.is_some() {
-            continue;
+    // candidates per still unmatched row: same IBAN first, then the rest
+    let candidates: Vec<Vec<usize>> = rows
+        .iter()
+        .zip(out.iter())
+        .map(|(r, m)| {
+            let (name, iban) = (fold(&r.name), norm(&r.iban));
+            if m.is_some() || name.len() < 3 {
+                return Vec::new();
+            }
+            let mut c: Vec<usize> = existing
+                .iter()
+                .enumerate()
+                .filter(|(j, e)| {
+                    !used[*j]
+                        && e.booking_date == r.booking_date
+                        && e.amount_cents == r.amount_cents
+                        && e.name_fold == name
+                        && (iban.is_empty() || e.iban_norm.is_empty() || e.iban_norm == iban)
+                })
+                .map(|(j, _)| j)
+                .collect();
+            c.sort_by_key(|&j| (iban.is_empty() || existing[j].iban_norm != iban, j));
+            c
+        })
+        .collect();
+    // owner[j] = row that holds existing booking j in this pass
+    let mut owner: HashMap<usize, usize> = HashMap::new();
+    fn assign(
+        i: usize,
+        candidates: &[Vec<usize>],
+        owner: &mut HashMap<usize, usize>,
+        seen: &mut Vec<usize>,
+    ) -> bool {
+        for &j in &candidates[i] {
+            if seen.contains(&j) {
+                continue;
+            }
+            seen.push(j);
+            let free = match owner.get(&j) {
+                None => true,
+                Some(&k) => assign(k, candidates, owner, seen),
+            };
+            if free {
+                owner.insert(j, i);
+                return true;
+            }
         }
-        let (name, iban) = (fold(&r.name), norm(&r.iban));
-        if name.len() < 3 {
-            continue;
+        false
+    }
+    for i in 0..rows.len() {
+        if !candidates[i].is_empty() {
+            assign(i, &candidates, &mut owner, &mut Vec::new());
         }
-        let hit = existing.iter().enumerate().position(|(j, e)| {
-            !used[j]
-                && e.booking_date == r.booking_date
-                && e.amount_cents == r.amount_cents
-                && e.name_fold == name
-                && (iban.is_empty() || e.iban_norm.is_empty() || e.iban_norm == iban)
-        });
-        if let Some(j) = hit {
-            used[j] = true;
-            *m = Some(j);
-        }
+    }
+    for (j, i) in owner {
+        used[j] = true;
+        out[i] = Some(j);
     }
 }
 
@@ -1349,31 +1394,57 @@ fn find_twin(
             })
         },
     )?;
-    // names and purposes without accents: MoneyMoney writes "Muller" where the
-    // bank sends "Müller"; the tax lines keep their own normalisation
-    let (n_iban, n_name, n_purpose) = (norm(iban), fold(name), fold(purpose));
-    let (tax_name, tax_purpose) = (norm(name), norm(purpose));
-    let mut hits = Vec::new();
-    for row in rows {
-        let t = row?;
-        let (m_iban, m_name) = (norm(&t.iban), fold(&t.name));
-        let ok = if !n_iban.is_empty() && !m_iban.is_empty() {
-            n_iban == m_iban
-        } else {
-            let long = n_name.len() >= 3 && m_name.len() >= 3;
-            (long && (n_name.contains(&m_name) || m_name.contains(&n_name)))
-                || (m_name.len() >= 3 && (n_purpose.contains(&m_name) || n_name.contains(&m_name)))
-                // the bank sends no counterparty (comdirect REST, some debits): the
-                // purposes still start the same (reference numbers, invoice text)
-                || purposes_alike(&n_purpose, &fold(&t.purpose))
-                || (tax_name.is_empty()
-                    && same_tax_line(&tax_purpose, &norm(&t.name), &norm(&t.purpose)))
-        };
-        if ok {
-            hits.push(t);
-        }
+    let candidates: Vec<Twin> = rows.collect::<Result<_, _>>()?;
+    // Exact names first, as before accents were ignored: a row that matches
+    // exactly must not be blocked by one that matches only without accents
+    // ("Dvořák" and "Dvorak" imported side by side). Only when that finds
+    // nothing unique, compare without accents – MoneyMoney writes "Muller"
+    // where the bank sends "Müller".
+    let exact = twin_hits(&candidates, iban, name, purpose, norm);
+    if let Some(id) = pick_twin(&exact) {
+        return Ok(Some(id));
     }
-    Ok(pick_twin(&hits))
+    Ok(pick_twin(&twin_hits(
+        &candidates,
+        iban,
+        name,
+        purpose,
+        fold,
+    )))
+}
+
+/// The candidates that may be the bank booking, names and purposes compared
+/// after `cmp` ([`norm`] or [`fold`]); the tax lines keep [`norm`], their
+/// table spells "solidaritätszuschlag" with the umlaut.
+fn twin_hits(
+    candidates: &[Twin],
+    iban: &str,
+    name: &str,
+    purpose: &str,
+    cmp: fn(&str) -> String,
+) -> Vec<Twin> {
+    let (n_iban, n_name, n_purpose) = (norm(iban), cmp(name), cmp(purpose));
+    let (tax_name, tax_purpose) = (norm(name), norm(purpose));
+    candidates
+        .iter()
+        .filter(|t| {
+            let (m_iban, m_name) = (norm(&t.iban), cmp(&t.name));
+            if !n_iban.is_empty() && !m_iban.is_empty() {
+                n_iban == m_iban
+            } else {
+                let long = n_name.len() >= 3 && m_name.len() >= 3;
+                (long && (n_name.contains(&m_name) || m_name.contains(&n_name)))
+                    || (m_name.len() >= 3
+                        && (n_purpose.contains(&m_name) || n_name.contains(&m_name)))
+                    // the bank sends no counterparty (comdirect REST, some debits):
+                    // the purposes still start the same (reference numbers, invoice text)
+                    || purposes_alike(&n_purpose, &cmp(&t.purpose))
+                    || (tax_name.is_empty()
+                        && same_tax_line(&tax_purpose, &norm(&t.name), &norm(&t.purpose)))
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 /// Imported rows of amount `?2` within two days of `?4`. The BETWEEN bounds, a
@@ -1391,6 +1462,7 @@ const TWIN_CANDIDATES_SQL: &str =
   ORDER BY id";
 
 /// A MoneyMoney row that may be the twin of a bank booking.
+#[derive(Clone)]
 struct Twin {
     id: i64,
     name: String,
@@ -2518,6 +2590,130 @@ Kartenzahlung;01.01.2030;;-5,00;Bäcker;;;Brötchen;Kartenzahlung;123456;Pocket;
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[1].0, "fints-1");
         assert!(rows[1].1.is_some(), "category carried over: {rows:?}");
+    }
+
+    const IBAN_A: &str = "DE02120300000000202051";
+    const IBAN_B: &str = "DE89370400440532013000";
+
+    /// Bank booking "Hannah Müller", 12 € on 23.03.2026, with or without IBAN.
+    fn bank_mueller(db: &Connection, acc: i64, ext: &str, iban: &str) {
+        db.execute(
+            "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, counterparty, counterparty_iban, purpose)
+             VALUES (?1, ?2, '2026-03-23', 1200, 'Hannah Müller', ?3, ?2)",
+            params![acc, ext, iban],
+        )
+        .unwrap();
+    }
+
+    /// Imports `rows` (IBAN;purpose;category) as "Hannah Muller", 12 € on
+    /// 23.03.2026, and returns bank id → category name of the live bookings.
+    fn import_muller(v: &Vault, acc: i64, rows: &[(&str, &str, &str)]) -> Vec<(String, String)> {
+        let mut csv = String::from("Datum;Name;IBAN;Verwendungszweck;Betrag;Kategorie;Notiz\n");
+        for (iban, purpose, cat) in rows {
+            csv += &format!("23.03.2026;Hannah Muller;{iban};{purpose};12,00;{cat};\n");
+        }
+        v.import_moneymoney_data(csv.into_bytes(), "t.csv".into(), Some(acc), true, true)
+            .unwrap();
+        let db = v.db().unwrap();
+        let mut st = db
+            .prepare(
+                "SELECT t.external_id, IFNULL(c.name, '') FROM transactions t
+                 LEFT JOIN categories c ON c.id = t.category_id
+                 WHERE t.account_id = ?1 AND t.deleted_ms IS NULL AND t.amount_cents = 1200
+                 ORDER BY t.external_id",
+            )
+            .unwrap();
+        st.query_map([acc], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn folded_names_find_a_complete_assignment_in_either_order() {
+        // E1 without IBAN, E2 with IBAN B; row "a" without IBAN fits both, row
+        // "z" with IBAN A only E1 – first fit in row order would strand "z"
+        for rows in [
+            [("", "Rechnung 1", "Eins"), (IBAN_A, "Rechnung 2", "Zwei")],
+            [(IBAN_A, "Rechnung 2", "Zwei"), ("", "Rechnung 1", "Eins")],
+        ] {
+            let (_dir, v) = vault();
+            let acc = mm_acct(&v, "01.03.2026;Arbeitgeber;Gehalt;100,00;;\n");
+            {
+                let db = v.db().unwrap();
+                bank_mueller(&db, acc, "fints-e1", "");
+                bank_mueller(&db, acc, "fints-e2", IBAN_B);
+            }
+            let got = import_muller(&v, acc, &rows);
+            assert_eq!(
+                got,
+                vec![
+                    ("fints-e1".into(), "Zwei".into()),
+                    ("fints-e2".into(), "Eins".into())
+                ],
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folded_names_prefer_the_same_iban_and_still_match_all() {
+        // rows with IBAN A and B; E1 without IBAN, E2 with IBAN A: A→E2, B→E1
+        for rows in [
+            [
+                (IBAN_A, "Rechnung A", "Eins"),
+                (IBAN_B, "Rechnung B", "Zwei"),
+            ],
+            [
+                (IBAN_B, "Rechnung B", "Zwei"),
+                (IBAN_A, "Rechnung A", "Eins"),
+            ],
+        ] {
+            let (_dir, v) = vault();
+            let acc = mm_acct(&v, "01.03.2026;Arbeitgeber;Gehalt;100,00;;\n");
+            {
+                let db = v.db().unwrap();
+                bank_mueller(&db, acc, "fints-e1", "");
+                bank_mueller(&db, acc, "fints-e2", IBAN_A);
+            }
+            let got = import_muller(&v, acc, &rows);
+            assert_eq!(
+                got,
+                vec![
+                    ("fints-e1".into(), "Zwei".into()),
+                    ("fints-e2".into(), "Eins".into())
+                ],
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_prefers_the_exactly_named_row_over_an_accent_twin() {
+        // "Dvořák" and "Dvorak" imported side by side; the bank's "Dvořák"
+        // belongs to the exact one even though both match without accents
+        let (_dir, v) = vault();
+        let acc = mm_acct(
+            &v,
+            "23.03.2026;Dvořák;Rechnung 1;-50,00;;\n23.03.2026;Dvorak;Rechnung 2;-50,00;;\n",
+        );
+        let db = v.db().unwrap();
+        assert!(adopt_import(
+            &db,
+            acc,
+            "fints-1",
+            "2026-03-23",
+            -5000,
+            "",
+            "Dvořák",
+            "Zahlung",
+            ""
+        )
+        .unwrap());
+        // the first row (Dvořák) took the bank's id, the second stays imported
+        let ids = ext_ids(&db, acc);
+        assert_eq!(ids[0], "fints-1", "{ids:?}");
+        assert!(ids[1].starts_with("mm-"), "{ids:?}");
     }
 
     #[test]
